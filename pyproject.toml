@@ -20,7 +20,6 @@ pydicom = { version = "^2.4.4", optional = true }
 dicomweb-client = { version = "^0.59.1", optional = true }
 spacy = { version = "^3.7.2", optional = true }
 # Core dependencies
-numpy = "^1.24.0"
 pandas = "^2.2.0"
 tqdm = "^4.66.1"
 requests = "^2.31.0"
