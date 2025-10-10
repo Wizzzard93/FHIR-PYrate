@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import io
 import logging
@@ -12,9 +13,21 @@ import tempfile
 import traceback
 import warnings
 from contextlib import contextmanager
+from ctypes.util import find_library
 from functools import partial
 from types import TracebackType
-from typing import Dict, Generator, List, Optional, TextIO, Tuple, Type, Union
+from typing import (
+    ClassVar,
+    Dict,
+    FrozenSet,
+    Generator,
+    List,
+    Optional,
+    TextIO,
+    Tuple,
+    Type,
+    Union,
+)
 
 import pandas as pd
 import pydicom
@@ -34,15 +47,12 @@ logger = logging.getLogger(__name__)
 # https://stackoverflow.com/questions/64674495/how-to-catch-simpleitk-warnings
 # https://github.com/hankcs/HanLP/blob/doc-zh/hanlp/utils/io_util.py
 try:
-    import ctypes
-    from ctypes.util import find_library
-except ImportError:
-    libc = None
-else:
-    try:
-        libc = ctypes.cdll.msvcrt  # Windows
-    except OSError:
-        libc = ctypes.cdll.LoadLibrary(find_library("c"))  # type: ignore
+    # Windows succeeds, POSIX raises
+    libc: Optional[ctypes.CDLL] = ctypes.cdll.msvcrt  # Windows
+except (OSError, AttributeError):
+    # POSIX fallback — "libc.so.*" on Linux, "libc.dylib" on macOS
+    c_name = find_library("c")
+    libc = ctypes.CDLL(c_name) if c_name else None
 
 
 def flush(stream: TextIO) -> None:
@@ -67,7 +77,7 @@ def fileno(file_or_fd: TextIO) -> Optional[int]:
 @contextmanager
 def stdout_redirected(
     to: Union[str, TextIO] = os.devnull, stdout: Optional[TextIO] = None
-) -> Generator:
+) -> Generator[Optional[TextIO], None, None]:
     if platform.system() == "Windows":
         yield None
         return
@@ -136,23 +146,25 @@ class DicomDownloader:
     :param num_processes: The number of processes to run for downloading
     """
 
-    ACCEPTED_FORMATS = {
-        ".dcm",
-        ".nia",
-        ".nii",
-        ".nii.gz",
-        ".hdr",
-        ".img",
-        ".img.gz",
-        ".tif",
-        ".TIF",
-        ".tiff",
-        ".TIFF",
-        ".mha",
-        ".mhd",
-        ".nrrd",
-        ".nhdr",
-    }
+    ACCEPTED_FORMATS: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            ".dcm",
+            ".nia",
+            ".nii",
+            ".nii.gz",
+            ".hdr",
+            ".img",
+            ".img.gz",
+            ".tif",
+            ".TIF",
+            ".tiff",
+            ".TIFF",
+            ".mha",
+            ".mhd",
+            ".nrrd",
+            ".nhdr",
+        }
+    )
 
     def __init__(
         self,
@@ -239,7 +251,7 @@ class DicomDownloader:
     @staticmethod
     def get_download_id(
         study_uid: str,
-        series_uid: str = None,
+        series_uid: Optional[str] = None,
         always_download_in_study_folder: bool = False,
     ) -> str:
         """
@@ -259,7 +271,7 @@ class DicomDownloader:
 
     def get_download_path(self, download_id: str) -> pathlib.Path:
         """
-        Builds the folder hierarchy where the data will be stored. The hierarchy depends on the
+        Build the folder hierarchy where the data will be stored. The hierarchy depends on the
         `hierarchical_storage` parameter. Given a download ID
         263a1dad02916f5eca3c4eec51dc9d281735b47b8eb8bc2343c56e6ccd and `hierarchical_storage` = 2,
         the data will be stored in 26/3a/1dad02916f5eca3c4eec51dc9d281735b47b8eb8bc2343c56e6ccd.
@@ -277,13 +289,13 @@ class DicomDownloader:
     def download_data(
         self,
         study_uid: str,
-        series_uid: str = None,
+        series_uid: Optional[str] = None,
         output_dir: Union[str, pathlib.Path] = "out",
         save_metadata: bool = True,
         existing_ids: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """
-        Downloads the data related to the StudyInstanceUID and SeriesInstanceUID (if given,
+        Download the data related to the StudyInstanceUID and SeriesInstanceUID (if given,
         otherwise the entire study will be downloaded).
 
         :param study_uid: The StudyInstanceUID
@@ -333,7 +345,7 @@ class DicomDownloader:
             base_dict[self.series_instance_uid_field] = series_uid
 
         # Init the readers/writers
-        series_reader = sitk.ImageSeriesReader()  # type: ignore
+        series_reader = sitk.ImageSeriesReader()
         with tempfile.TemporaryDirectory() as tmp_dir:
             # Create the download dir
             current_tmp_dir = pathlib.Path(tmp_dir)
@@ -361,11 +373,11 @@ class DicomDownloader:
             progress_bar.close()
 
             # Get Series ID names from folder
-            series_uids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(current_tmp_dir))  # type: ignore
+            series_uids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(current_tmp_dir))
             logger.info(f"Study ID has {len(series_uids)} series.")
             for series in series_uids:
                 # Get the DICOMs corresponding to the series
-                files = series_reader.GetGDCMSeriesFileNames(  # type: ignore
+                files = series_reader.GetGDCMSeriesFileNames(
                     str(current_tmp_dir), series
                 )
                 current_dict = base_dict.copy()
@@ -374,11 +386,12 @@ class DicomDownloader:
                 )
                 try:
                     # Read the series
-                    with simpleitk_warning_file.open("w") as f, stdout_redirected(
-                        f, stdout=sys.stderr
+                    with (
+                        simpleitk_warning_file.open("w") as f,
+                        stdout_redirected(f, stdout=sys.stderr),
                     ):
-                        series_reader.SetFileNames(files)  # type: ignore
-                        image = series_reader.Execute()  # type: ignore
+                        series_reader.SetFileNames(files)
+                        image = series_reader.Execute()
                     with simpleitk_warning_file.open("r") as f:
                         content = f.read()
                     if "warning" in content.lower():
@@ -431,9 +444,9 @@ class DicomDownloader:
                         series_download_dir / f"{series}_meta.dcm",
                     )
                 dcm_info = pydicom.dcmread(str(files[0]), stop_before_pixels=True)
-                current_dict[
-                    self.deid_study_instance_uid_field
-                ] = dcm_info.StudyInstanceUID
+                current_dict[self.deid_study_instance_uid_field] = (
+                    dcm_info.StudyInstanceUID
+                )
                 current_dict[self.deid_series_instance_uid_field] = series
                 downloaded_series_info.append(current_dict)
 
@@ -442,7 +455,7 @@ class DicomDownloader:
     def fix_mapping_dataframe(
         self,
         df: pd.DataFrame,
-        mapping_df: pd.DataFrame = None,
+        mapping_df: Optional[pd.DataFrame] = None,
         output_dir: Union[str, pathlib.Path] = "out",
         study_uid_col: str = "study_instance_uid",
         series_uid_col: str = "series_instance_uid",
@@ -464,7 +477,8 @@ class DicomDownloader:
         output_dir = pathlib.Path(output_dir)
         if not output_dir.exists() or not len(list(output_dir.glob("*"))):
             warnings.warn(
-                "Cannot fix the mapping file if the output directory does not exist."
+                "Cannot fix the mapping file if the output directory does not exist.",
+                stacklevel=2,
             )
             return None
         if mapping_df is None:
@@ -547,7 +561,7 @@ class DicomDownloader:
         output_dir: Union[str, pathlib.Path] = "out",
         study_uid_col: str = "study_instance_uid",
         series_uid_col: Optional[str] = "series_instance_uid",
-        mapping_df: pd.DataFrame = None,
+        mapping_df: Optional[pd.DataFrame] = None,
         download_full_study: bool = False,
         save_metadata: bool = True,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -593,7 +607,8 @@ class DicomDownloader:
             warnings.warn(
                 "download_full_study = False will only download a specified series but "
                 "have not provided a valid Series UID column of the DataFrame, "
-                "as a result the full study will be downloaded."
+                "as a result the full study will be downloaded.",
+                stacklevel=2,
             )
 
         # Create list of rows
