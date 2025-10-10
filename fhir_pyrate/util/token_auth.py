@@ -30,6 +30,10 @@ class TokenAuth(requests.auth.AuthBase):
     :param token_refresh_delta: Either a timedelta object that tells us how often the token
     should be refreshed, or a number of minutes; this does not need to be specified for JWT tokens
     that contain the expiry date
+    :param jwt_refresh_leeway: Either a timedelta object or a number of minutes to refresh
+    a JWT token before its exp time. If provided and the token has an exp claim, the token
+    will be refreshed when now >= (exp - leeway). If not provided, a fallback rule refreshes
+    after 75% of the token lifetime has elapsed (if iat and exp are present).
     """
 
     def __init__(
@@ -41,6 +45,7 @@ class TokenAuth(requests.auth.AuthBase):
         session: Optional[requests.Session] = None,
         max_login_attempts: int = 5,
         token_refresh_delta: Optional[Union[int, timedelta]] = None,
+        jwt_refresh_leeway: Optional[Union[int, timedelta]] = None,
     ) -> None:
         self._username = username
         self._password = password
@@ -51,8 +56,6 @@ class TokenAuth(requests.auth.AuthBase):
             self._session = session
         # Session for handling the tokens
         self._token_session = requests.Session()
-        # Add hook to re-authenticate if the token is not valid
-        self._session.hooks["response"].append(self._refresh_hook)
         self.auth_url = auth_url
         self.refresh_url = refresh_url
         self._max_login_attempts = max_login_attempts
@@ -63,6 +66,12 @@ class TokenAuth(requests.auth.AuthBase):
             if token_refresh_delta is not None
             else None
         )
+        self._jwt_refresh_leeway: Optional[timedelta] = None
+        # Interpret int leeway as minutes for consistency with token_refresh_delta
+        if isinstance(jwt_refresh_leeway, timedelta):
+            self._jwt_refresh_leeway = jwt_refresh_leeway
+        elif jwt_refresh_leeway is not None:
+            self._jwt_refresh_leeway = timedelta(minutes=jwt_refresh_leeway)  # type: ignore[arg-type]
         self.token: Optional[str] = None
         self._authenticate()
         self.auth_time = now_utc()
@@ -85,6 +94,12 @@ class TokenAuth(requests.auth.AuthBase):
         :param r: The prepared request that should be sent
         :return: The prepared request
         """
+        # Proactively refresh the token before each request, if needed
+        if self.token is None or self.is_refresh_required():
+            try:
+                self.refresh_token()
+            except Exception:  # Let the request fail later if refresh also fails
+                logger.exception("Token refresh attempt failed before request send.")
         r.headers.update({"Authorization": f"Bearer {self.token}"})
         return r
 
@@ -103,16 +118,24 @@ class TokenAuth(requests.auth.AuthBase):
                 jwt=self.token,
                 options={"verify_signature": False},
             )
-            # Get 25 percent of the time we have in total
-            refresh_interval = (
-                (decoded["exp"] - decoded["iat"]) / 4
-                if "exp" in decoded and "iat" in decoded
-                else None
-            )
-            # If there is no expiration time return False
-            # If we are already in the last 25% of the time return True
-            return refresh_interval is not None and now_utc().timestamp() > (
-                decoded.get("exp") - refresh_interval
+            now_ts = now_utc().timestamp()
+            exp = decoded.get("exp")
+            iat = decoded.get("iat")
+            # If exp is present, prefer a leeway-based refresh if configured
+            if exp is not None:
+                if self._jwt_refresh_leeway is not None:
+                    leeway_seconds = self._jwt_refresh_leeway.total_seconds()
+                    return now_ts >= (exp - leeway_seconds)
+                # Fallback: refresh once the last 25% of token lifetime begins
+                if iat is not None:
+                    refresh_interval = (exp - iat) / 4
+                    return now_ts > (exp - refresh_interval)
+                # If iat missing but exp exists, refresh only at expiry (no early refresh)
+                return now_ts >= exp
+            # No exp claim; fall back to non-JWT/counter-based logic below
+            return (
+                self._token_refresh_delta is not None
+                and (now_utc() - self.auth_time) > self._token_refresh_delta
             )
         except jwt.exceptions.PyJWTError:
             # If we are here it means that it is not a JWT token
@@ -133,6 +156,7 @@ class TokenAuth(requests.auth.AuthBase):
         logger.info("Refreshing session...")
         if token is not None:
             self.token = token
+            self.auth_time = now_utc()
         elif self.refresh_url is not None:
             response = self._token_session.get(f"{self.refresh_url}")
             # Was not refreshed on time
@@ -149,43 +173,16 @@ class TokenAuth(requests.auth.AuthBase):
     def _refresh_hook(
         self, response: requests.Response, *args: Any, **kwargs: Any
     ) -> Optional[requests.Response]:
-        """
-        Check whether the login was successful and
-        if it was not, it either refreshes the token or authenticates the user again.
-
-        :param response: The received response
-        :param args: Additional arguments
-        :param kwargs: Additional keyword arguments
-        :return: The response of the request that will be sent
-        """
-        if (
-            # If we get an unauthorized or if we should refresh
-            response.status_code == requests.codes.unauthorized
-            or self.is_refresh_required()
-        ):
-            # If the state is unauthorized,
-            # then we should set how many times we have tried logging in
+        # Deprecated: response-hook based refresh is no longer used. Keep for backward
+        # compatibility but perform no automatic resend here to avoid recursion during long
+        # streaming/bundle operations. Token refresh is handled proactively before requests
+        # and on 401 retry paths where applicable.
+        try:
             if response.status_code == requests.codes.unauthorized:
-                login_attempts: int = getattr(
-                    response.request, "login_reattempted_times", 0
-                )
-                logger.info("Refreshing token because of unauthorized status.")
-                login_attempts += 1
-                if login_attempts >= self._max_login_attempts:
-                    response.raise_for_status()
-                setattr(response.request, "login_reattempted_times", login_attempts)  # noqa
-            else:
-                logger.info("Refreshing token refresh is required.")
-
-            # If the token is None, then we were never actually authenticated
-            if self.token is None:
-                response.raise_for_status()
-            else:
-                self.token = None
+                logger.info("Received 401 in response hook; triggering token refresh only.")
                 self.refresh_token()
-            # Authenticate and send again
-            return self._session.send(self(response.request), **kwargs)
-        else:
-            # Raise an error for all other cases (if any)
-            response.raise_for_status()
-        return None
+        except Exception:
+            logger.error("Token refresh in deprecated response hook failed.")
+            logger.error("", exc_info=True)
+        # Do not resend the request from the hook; let caller handle retry.
+        return response

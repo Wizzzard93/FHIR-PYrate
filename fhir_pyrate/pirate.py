@@ -937,17 +937,28 @@ class Pirate:
         :param request_url: The request string
         :return: A FHIR bundle
         """
+        def _send() -> requests.Response:
+            return self.session.get(request_url, **self.optional_get_params)
+
         try:
-            response = self.session.get(request_url, **self.optional_get_params)
+            response = _send()
             if self._print_request_url:
                 tqdm.write(request_url)
+            # Retry once on 401 after forcing token refresh, if supported
+            if response.status_code == requests.codes.unauthorized:
+                try:
+                    auth = getattr(self.session, "auth", None)
+                    # TokenAuth exposes refresh_token; call it if present
+                    if hasattr(auth, "refresh_token"):
+                        auth.refresh_token()
+                        response = _send()
+                except Exception:
+                    logger.error("Token refresh on 401 failed:")
+                    logger.error(traceback.format_exc())
             response.raise_for_status()
             json_response = response.json()
-            # If it's a bundle return it
             if json_response.get("resourceType") == "Bundle":
                 return FHIRObj(**json_response)
-            # Otherwise it's a read operation (are there other options?)
-            # and we should convert it to a bundle for the sake of consistency
             else:
                 return FHIRObj(
                     **{
@@ -955,15 +966,11 @@ class Pirate:
                         "type": "read",
                         "total": 1,
                         "entry": [
-                            {
-                                "full_url": request_url,
-                                "resource": json_response,
-                            }
+                            {"full_url": request_url, "resource": json_response}
                         ],
                     }
                 )
         except Exception:
-            # Leave this to be able to quickly see the errors
             logger.error(traceback.format_exc())
             return None
 

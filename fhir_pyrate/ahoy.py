@@ -36,6 +36,8 @@ class Ahoy:
     :param session: The session that can be used for the authentication. This is particularly
     useful if you have some particular requirements for your authentication (e.g. you need to
     support for cusum self-signed certificates).
+    :param jwt_refresh_leeway: Either a timedelta object or a number of minutes to refresh
+    a JWT token before its exp time. Passed through to `TokenAuth`.
     """
 
     def __init__(
@@ -49,6 +51,7 @@ class Ahoy:
         max_login_attempts: int = 5,
         token_refresh_delta: Optional[Union[int, timedelta]] = None,
         session: Optional[requests.Session] = None,
+        jwt_refresh_leeway: Optional[Union[int, timedelta]] = None,
     ) -> None:
         self.auth_type = auth_type
         self.auth_method = auth_method
@@ -64,6 +67,7 @@ class Ahoy:
             self.session = session
         self.max_login_attempts = max_login_attempts
         self.token_refresh_delta = token_refresh_delta
+        self.jwt_refresh_leeway = jwt_refresh_leeway
         if self.auth_type is not None and self.auth_method is not None:
             self._authenticate()
 
@@ -135,6 +139,7 @@ class Ahoy:
                 session=self.session,
                 max_login_attempts=self.max_login_attempts,
                 token_refresh_delta=self.token_refresh_delta,
+                jwt_refresh_leeway=self.jwt_refresh_leeway,
             )
         elif self.auth_type.lower() == "basicauth":
             self.session.auth = HTTPBasicAuth(username, password)
